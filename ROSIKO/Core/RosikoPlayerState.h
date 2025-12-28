@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/PlayerState.h"
 #include "../Configs/GameRulesConfig.h" // Per FTerritoryCard
+#include "../Configs/ObjectivesConfig.h" // Per FAssignedObjective
 #include "RosikoPlayerState.generated.h"
 
 /**
@@ -60,6 +61,23 @@ public:
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Game State")
 	bool bIsAI = false;
 
+	// === OBIETTIVI ===
+
+	// Obiettivo principale assegnato (missione segreta)
+	// Replicato solo al proprietario per mantenere la segretezza
+	UPROPERTY(ReplicatedUsing = OnRep_MainObjective, BlueprintReadOnly, Category = "Objectives")
+	FAssignedObjective MainObjective;
+
+	// Obiettivi secondari assegnati (4 carte obiettivo per punti vittoria)
+	// Replicato solo al proprietario per mantenere la segretezza
+	UPROPERTY(ReplicatedUsing = OnRep_SecondaryObjectives, BlueprintReadOnly, Category = "Objectives")
+	TArray<FAssignedObjective> SecondaryObjectives;
+
+	// ID del giocatore che ha eliminato questo player (-1 se ancora vivo o eliminato dal sistema)
+	// Usato per obiettivi tipo "Elimina giocatore colore X"
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Game State")
+	int32 EliminatedBy = -1;
+
 	// === METODI PUBBLICI ===
 
 	// Imposta GameManagerPlayerID (chiamato dal GameMode quando player si connette)
@@ -107,5 +125,59 @@ public:
 	// Verifica se possiede un territorio specifico
 	UFUNCTION(BlueprintCallable, Category = "Game State")
 	bool OwnsTerritory(int32 TerritoryID) const { return OwnedTerritoryIDs.Contains(TerritoryID); }
+
+	// === OBIETTIVI - QUERY METHODS ===
+
+	// Calcola punti vittoria totali da obiettivi secondari completati
+	UFUNCTION(BlueprintPure, Category = "Objectives")
+	int32 GetTotalVictoryPoints() const;
+
+	// Verifica se l'obiettivo principale è stato completato
+	UFUNCTION(BlueprintPure, Category = "Objectives")
+	bool HasCompletedMainObjective() const { return MainObjective.bCompleted; }
+
+	// Ottieni numero di obiettivi secondari completati
+	UFUNCTION(BlueprintPure, Category = "Objectives")
+	int32 GetCompletedSecondaryCount() const;
+
+	// Verifica se tutti gli obiettivi secondari sono stati completati
+	UFUNCTION(BlueprintPure, Category = "Objectives")
+	bool HasCompletedAllSecondaryObjectives() const;
+
+	// Ottieni lista di tutti gli obiettivi (principale + secondari) per UI
+	UFUNCTION(BlueprintPure, Category = "Objectives")
+	TArray<FAssignedObjective> GetAllObjectives() const;
+
+	// === EVENTI ===
+
+	// Evento dispatcher quando gli obiettivi vengono assegnati/aggiornati
+	DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnObjectivesUpdatedSignature);
+
+	UPROPERTY(BlueprintAssignable, Category = "Objectives")
+	FOnObjectivesUpdatedSignature OnObjectivesUpdated;
+
+	// === REP NOTIFIES ===
+
+	// Chiamato quando MainObjective viene replicato
+	UFUNCTION()
+	void OnRep_MainObjective();
+
+	// Chiamato quando SecondaryObjectives vengono replicati
+	UFUNCTION()
+	void OnRep_SecondaryObjectives();
+
+	// === OBIETTIVI - ASSIGNMENT METHODS (chiamati dal GameManager) ===
+
+	// Assegna obiettivo principale
+	void AssignMainObjective(const FObjectiveDefinition& Objective, int32 ObjectiveIndex);
+
+	// Assegna obiettivo secondario (fino a 4)
+	void AssignSecondaryObjective(const FObjectiveDefinition& Objective, int32 ObjectiveIndex);
+
+	// Marca obiettivo principale come completato
+	void CompleteMainObjective(int32 CompletionTurn, float CompletionTime);
+
+	// Marca obiettivo secondario come completato (per index)
+	void CompleteSecondaryObjective(int32 SecondaryIndex, int32 CompletionTurn, float CompletionTime);
 };
 

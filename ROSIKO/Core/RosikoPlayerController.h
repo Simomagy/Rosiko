@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/PlayerController.h"
+#include "InputActionValue.h"
 #include "RosikoPlayerController.generated.h"
 
 /**
@@ -15,6 +16,25 @@ class ROSIKO_API ARosikoPlayerController : public APlayerController
 
 public:
 	ARosikoPlayerController();
+
+protected:
+	virtual void BeginPlay() override;
+	virtual void SetupInputComponent() override;
+
+public:
+	// === INPUT MAPPING CONTEXT (Enhanced Input) ===
+
+	// Input Mapping Context per controlli di gioco (Tab per obiettivi, etc.)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Input")
+	class UInputMappingContext* GameMappingContext;
+
+	// Priority per Game Mapping Context (default 0)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Input")
+	int32 GameMappingPriority = 0;
+
+	// Input Action per toggle pannello obiettivi
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Input")
+	class UInputAction* ToggleObjectivesAction;
 
 	// === SERVER RPC: GAME COMMANDS ===
 	// Questi RPC permettono ai client di inviare comandi al server
@@ -30,6 +50,11 @@ public:
 	// Client notifica il server che ha completato la generazione mappa ed è pronto
 	UFUNCTION(Server, Reliable, BlueprintCallable, Category = "Game Commands")
 	void Server_NotifyClientReady();
+
+	// === UI COMMANDS (Local) ===
+
+	// Toggle pannello obiettivi (chiamato da Input Action)
+	void ToggleObjectivesPanel(const FInputActionValue& Value);
 
 private:
 	// Cached reference al GameManager

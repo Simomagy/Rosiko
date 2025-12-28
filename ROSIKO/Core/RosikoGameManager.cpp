@@ -5,6 +5,7 @@
 #include "../Map/Territory/TerritoryActor.h"
 #include "../Troop/UI/TroopDisplayComponent.h"
 #include "../Troop/UI/TroopVisualManager.h"
+#include "../Configs/ObjectivesConfig.h"
 #include "Net/UnrealNetwork.h"
 #include "EngineUtils.h"
 #include "GameFramework/GameStateBase.h"
@@ -673,9 +674,13 @@ void ARosikoGameManager::SelectPlayerColor_Direct(int32 PlayerID, FLinearColor C
 
 		if (bAllSelected)
 		{
-			// Tutti hanno scelto → Procedi con distribuzione territori
-			UE_LOG(LogRosikoGameManager, Log, TEXT("All players selected colors. Starting territory distribution..."));
+			// Tutti hanno scelto → Assegna obiettivi e procedi con distribuzione territori
+			UE_LOG(LogRosikoGameManager, Log, TEXT("All players selected colors. Assigning objectives..."));
 
+			// NUOVO: Assegna obiettivi prima di distribuire territori
+			AssignObjectivesToAllPlayers();
+
+			UE_LOG(LogRosikoGameManager, Log, TEXT("Starting territory distribution..."));
 			DistributeInitialTerritories();
 			ChangePhase(EGamePhase::InitialDistribution);
 			GS->CurrentPlayerTurn = 0; // Reset al primo player in TurnOrder
@@ -774,6 +779,16 @@ void ARosikoGameManager::EndTurn()
 	{
 		UE_LOG(LogRosikoGameManager, Error, TEXT("EndTurn - GameState is null!"));
 		return;
+	}
+
+	// NUOVO: Verifica completamento obiettivi del giocatore corrente prima di cambiare turno
+	if (GS->CurrentPhase != EGamePhase::Setup && GS->CurrentPhase != EGamePhase::ColorSelection)
+	{
+		if (GS->TurnOrder.IsValidIndex(GS->CurrentPlayerTurn))
+		{
+			int32 CurrentPlayerID = GS->TurnOrder[GS->CurrentPlayerTurn];
+			CheckPlayerObjectives(CurrentPlayerID);
+		}
 	}
 
 	// Cerca prossimo player con carri da piazzare (durante fase InitialDistribution)
@@ -1070,3 +1085,459 @@ void ARosikoGameManager::ChangeTurn(int32 NewTurnIndex)
 	OnTurnChanged.Broadcast(GS->CurrentPlayerTurn);
 }
 
+// === OBIETTIVI - PUBLIC API ===
+
+void ARosikoGameManager::AssignObjectivesToAllPlayers()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogRosikoGameManager, Error, TEXT("AssignObjectivesToAllPlayers called on client - must be server!"));
+		return;
+	}
+
+	if (!ObjectivesConfig)
+	{
+		UE_LOG(LogRosikoGameManager, Error, TEXT("ObjectivesConfig is null! Assign an ObjectivesConfig Data Asset."));
+		return;
+	}
+
+	UE_LOG(LogRosikoGameManager, Warning, TEXT("Assigning objectives to all players..."));
+
+	// 1. Filtra e mescola obiettivi validi
+	FilterAndShuffleObjectives();
+
+	// 2. Verifica che ci siano abbastanza obiettivi
+	if (ValidMainObjectives.Num() < NumPlayers && !ObjectivesConfig->bAllowDuplicateMainObjectives)
+	{
+		UE_LOG(LogRosikoGameManager, Error, TEXT("Not enough valid main objectives (%d) for %d players!"),
+		       ValidMainObjectives.Num(), NumPlayers);
+		return;
+	}
+
+	// Verifica obiettivi secondari solo se ne dobbiamo assegnare
+	if (ObjectivesConfig->NumSecondaryObjectivesPerPlayer > 0)
+	{
+		int32 RequiredSecondaryObjectives = NumPlayers * ObjectivesConfig->NumSecondaryObjectivesPerPlayer;
+		if (ValidSecondaryObjectives.Num() < RequiredSecondaryObjectives && !ObjectivesConfig->bAllowDuplicateSecondaryObjectives)
+		{
+			UE_LOG(LogRosikoGameManager, Warning, TEXT("Not enough valid secondary objectives (%d) for %d players (need %d). Will allow duplicates."),
+			       ValidSecondaryObjectives.Num(), NumPlayers, RequiredSecondaryObjectives);
+		}
+	}
+
+	// 3. Assegna obiettivi a ogni giocatore in TurnOrder
+	ARosikoGameState* GS = GetRosikoGameState();
+	if (!GS) return;
+
+	for (int32 PlayerID : GS->TurnOrder)
+	{
+		ARosikoPlayerState* PS = GetRosikoPlayerState(PlayerID);
+		if (PS)
+		{
+			AssignObjectivesToPlayer(PS);
+		}
+	}
+
+	UE_LOG(LogRosikoGameManager, Warning, TEXT("Objectives assigned to all players successfully!"));
+}
+
+bool ARosikoGameManager::CheckPlayerObjectives(int32 PlayerID)
+{
+	if (!HasAuthority())
+	{
+		return false; // Solo il server valuta obiettivi
+	}
+
+	ARosikoPlayerState* PS = GetRosikoPlayerState(PlayerID);
+	ARosikoGameState* GS = GetRosikoGameState();
+
+	if (!PS || !GS)
+	{
+		return false;
+	}
+
+	bool bAnyObjectiveCompleted = false;
+
+	// Verifica obiettivo principale (se non già completato)
+	if (!PS->MainObjective.bCompleted && PS->MainObjective.ObjectiveIndex >= 0)
+	{
+		bool bAllConditionsMet = true;
+		for (const FObjectiveCondition& Condition : PS->MainObjective.Definition.Conditions)
+		{
+			if (!EvaluateObjectiveCondition(Condition, PS))
+			{
+				bAllConditionsMet = false;
+				break;
+			}
+		}
+
+		if (bAllConditionsMet)
+		{
+			PS->CompleteMainObjective(GS->CurrentPlayerTurn, GS->GameTimeSeconds);
+			bAnyObjectiveCompleted = true;
+
+			// TODO: Broadcast evento vittoria se obiettivo principale completato
+			UE_LOG(LogRosikoGameManager, Warning, TEXT(">>> PLAYER %d COMPLETED MAIN OBJECTIVE! <<<"), PlayerID);
+		}
+	}
+
+	// Verifica obiettivi secondari
+	for (int32 i = 0; i < PS->SecondaryObjectives.Num(); i++)
+	{
+		FAssignedObjective& SecondaryObj = PS->SecondaryObjectives[i];
+
+		if (SecondaryObj.bCompleted)
+		{
+			continue; // Già completato, skip
+		}
+
+		bool bAllConditionsMet = true;
+		for (const FObjectiveCondition& Condition : SecondaryObj.Definition.Conditions)
+		{
+			if (!EvaluateObjectiveCondition(Condition, PS))
+			{
+				bAllConditionsMet = false;
+				break;
+			}
+		}
+
+		if (bAllConditionsMet)
+		{
+			PS->CompleteSecondaryObjective(i, GS->CurrentPlayerTurn, GS->GameTimeSeconds);
+			bAnyObjectiveCompleted = true;
+		}
+	}
+
+	return bAnyObjectiveCompleted;
+}
+
+void ARosikoGameManager::CheckAllObjectivesCompletion()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	UE_LOG(LogRosikoGameManager, Log, TEXT("Checking objectives completion for all players..."));
+
+	TArray<ARosikoPlayerState*> AllPlayers = GetAllPlayerStates();
+
+	for (ARosikoPlayerState* PS : AllPlayers)
+	{
+		if (PS && PS->bIsAlive)
+		{
+			CheckPlayerObjectives(PS->GameManagerPlayerID);
+		}
+	}
+}
+
+// === OBIETTIVI - INTERNAL LOGIC ===
+
+void ARosikoGameManager::FilterAndShuffleObjectives()
+{
+	ARosikoGameState* GS = GetRosikoGameState();
+	if (!GS || !ObjectivesConfig)
+	{
+		UE_LOG(LogRosikoGameManager, Error, TEXT("FilterAndShuffleObjectives - GameState or ObjectivesConfig is null!"));
+		return;
+	}
+
+	// Ottieni colori attivi in partita (già selezionati dai giocatori)
+	TArray<FLinearColor> ActiveColors;
+	TArray<ARosikoPlayerState*> AllPlayers = GetAllPlayerStates();
+	for (ARosikoPlayerState* PS : AllPlayers)
+	{
+		if (PS && PS->bHasSelectedColor)
+		{
+			ActiveColors.Add(PS->ArmyColor);
+		}
+	}
+
+	// Filtra obiettivi validi
+	ValidMainObjectives = ObjectivesConfig->FilterValidMainObjectives(NumPlayers, ActiveColors);
+	ValidSecondaryObjectives = ObjectivesConfig->FilterValidSecondaryObjectives(NumPlayers, ActiveColors);
+
+	UE_LOG(LogRosikoGameManager, Log, TEXT("Filtered objectives: %d main, %d secondary"),
+	       ValidMainObjectives.Num(), ValidSecondaryObjectives.Num());
+
+	// Shuffle deterministico con GameRNG
+	// Fisher-Yates shuffle per main objectives
+	for (int32 i = ValidMainObjectives.Num() - 1; i > 0; i--)
+	{
+		int32 j = GameRNG.RandRange(0, i);
+		ValidMainObjectives.Swap(i, j);
+	}
+
+	// Fisher-Yates shuffle per secondary objectives
+	for (int32 i = ValidSecondaryObjectives.Num() - 1; i > 0; i--)
+	{
+		int32 j = GameRNG.RandRange(0, i);
+		ValidSecondaryObjectives.Swap(i, j);
+	}
+
+	UE_LOG(LogRosikoGameManager, Log, TEXT("Objectives shuffled with deterministic RNG"));
+}
+
+void ARosikoGameManager::AssignObjectivesToPlayer(ARosikoPlayerState* PS)
+{
+	if (!PS)
+	{
+		return;
+	}
+
+	int32 PlayerID = PS->GameManagerPlayerID;
+
+	// Assegna 1 obiettivo principale
+	if (ValidMainObjectives.Num() > 0)
+	{
+		// Prendi il prossimo obiettivo principale disponibile
+		// Se bAllowDuplicateMainObjectives = false, usa PlayerID come indice
+		// Se bAllowDuplicateMainObjectives = true, usa modulo per permettere duplicati
+		int32 MainIndex = ObjectivesConfig->bAllowDuplicateMainObjectives
+			? (PlayerID % ValidMainObjectives.Num())
+			: FMath::Min(PlayerID, ValidMainObjectives.Num() - 1);
+
+		PS->AssignMainObjective(ValidMainObjectives[MainIndex], MainIndex);
+	}
+	else
+	{
+		UE_LOG(LogRosikoGameManager, Error, TEXT("No valid main objectives available for Player %d!"), PlayerID);
+	}
+
+	// Assegna N obiettivi secondari (configurabile)
+	int32 NumSecondariesToAssign = ObjectivesConfig->NumSecondaryObjectivesPerPlayer;
+
+	if (NumSecondariesToAssign > 0 && ValidSecondaryObjectives.Num() > 0)
+	{
+		int32 SecondaryStartIndex = PlayerID * NumSecondariesToAssign;
+		TArray<int32> UsedIndices; // Per evitare duplicati per stesso giocatore
+
+		for (int32 i = 0; i < NumSecondariesToAssign; i++)
+		{
+			int32 SecondaryIndex;
+
+			if (ObjectivesConfig->bAllowDuplicateSecondaryObjectives)
+			{
+				// Permetti duplicati tra giocatori, ma evita duplicati per stesso giocatore se bAllowDuplicatesPerPlayer = false
+				if (!ObjectivesConfig->bAllowDuplicatesPerPlayer)
+				{
+					// Cerca un indice non già usato da questo giocatore
+					int32 Attempts = 0;
+					do
+					{
+						SecondaryIndex = (SecondaryStartIndex + i + Attempts) % ValidSecondaryObjectives.Num();
+						Attempts++;
+					} while (UsedIndices.Contains(SecondaryIndex) && Attempts < ValidSecondaryObjectives.Num());
+
+					UsedIndices.Add(SecondaryIndex);
+				}
+				else
+				{
+					// Permetti anche duplicati per stesso giocatore
+					SecondaryIndex = (SecondaryStartIndex + i) % ValidSecondaryObjectives.Num();
+				}
+			}
+			else
+			{
+				// No duplicati tra giocatori: usa indici sequenziali
+				SecondaryIndex = (SecondaryStartIndex + i) % ValidSecondaryObjectives.Num();
+			}
+
+			PS->AssignSecondaryObjective(ValidSecondaryObjectives[SecondaryIndex], SecondaryIndex);
+		}
+	}
+
+	UE_LOG(LogRosikoGameManager, Log, TEXT("Player %d - Assigned 1 main + %d secondary objectives"),
+	       PlayerID, PS->SecondaryObjectives.Num());
+}
+
+bool ARosikoGameManager::EvaluateObjectiveCondition(const FObjectiveCondition& Condition, ARosikoPlayerState* PS)
+{
+	if (!PS)
+	{
+		return false;
+	}
+
+	ARosikoGameState* GS = GetRosikoGameState();
+	if (!GS)
+	{
+		return false;
+	}
+
+	int32 PlayerID = PS->GameManagerPlayerID;
+
+	switch (Condition.Type)
+	{
+		case EObjectiveConditionType::ConquerTerritories:
+		{
+			// Verifica se il giocatore possiede almeno RequiredCount territori
+			return PS->GetNumTerritoriesOwned() >= Condition.RequiredCount;
+		}
+
+		case EObjectiveConditionType::ConquerContinents:
+		{
+			// Conta quanti continenti target il giocatore controlla completamente
+			int32 ControlledCount = 0;
+			for (int32 ContinentID : Condition.TargetContinentIDs)
+			{
+				if (DoesPlayerControlContinent(PlayerID, ContinentID))
+				{
+					ControlledCount++;
+				}
+			}
+			return ControlledCount >= Condition.RequiredCount;
+		}
+
+		case EObjectiveConditionType::ConquerTerritoriesInContinents:
+		{
+			// Conta territori posseduti nei continenti target
+			int32 TotalTerritories = 0;
+			for (int32 ContinentID : Condition.TargetContinentIDs)
+			{
+				TotalTerritories += CountPlayerTerritoriesInContinent(PlayerID, ContinentID);
+			}
+			return TotalTerritories >= Condition.RequiredCount;
+		}
+
+		case EObjectiveConditionType::ControlFullContinent:
+		{
+			// Verifica che il giocatore controlli completamente almeno RequiredCount continenti tra quelli target
+			int32 FullyControlledCount = 0;
+			for (int32 ContinentID : Condition.TargetContinentIDs)
+			{
+				if (DoesPlayerControlContinent(PlayerID, ContinentID))
+				{
+					FullyControlledCount++;
+				}
+			}
+			return FullyControlledCount >= Condition.RequiredCount;
+		}
+
+		case EObjectiveConditionType::EliminatePlayerColor:
+		{
+			// Verifica che il giocatore abbia eliminato un giocatore con uno dei colori target
+			TArray<ARosikoPlayerState*> AllPlayers = GetAllPlayerStates();
+			for (ARosikoPlayerState* OtherPS : AllPlayers)
+			{
+				if (!OtherPS || OtherPS->GameManagerPlayerID == PlayerID)
+				{
+					continue; // Skip self
+				}
+
+				// Verifica se OtherPS ha un colore target ed è stato eliminato da PS
+				for (const FLinearColor& TargetColor : Condition.TargetColors)
+				{
+					if (OtherPS->ArmyColor.Equals(TargetColor, 0.01f) &&
+					    !OtherPS->bIsAlive &&
+					    OtherPS->EliminatedBy == PlayerID)
+					{
+						return true;
+					}
+				}
+			}
+			return false;
+		}
+
+		case EObjectiveConditionType::ControlAdjacentTerritories:
+		{
+			// TODO: Implementare logica per territori confinanti consecutivi
+			// Richiede graph traversal dei territori posseduti
+			UE_LOG(LogRosikoGameManager, Warning, TEXT("ControlAdjacentTerritories not yet implemented"));
+			return false;
+		}
+
+		case EObjectiveConditionType::SurviveUntilTurn:
+		{
+			// Verifica che il giocatore sia vivo, abbia raggiunto il turno richiesto e abbia abbastanza territori
+			return PS->bIsAlive &&
+			       GS->CurrentPlayerTurn >= Condition.RequiredTurn &&
+			       PS->GetNumTerritoriesOwned() >= Condition.MinTerritories;
+		}
+
+		case EObjectiveConditionType::ExchangeCardSets:
+		{
+			// Verifica numero di scambi carte effettuati
+			return PS->CardExchangeCount >= Condition.RequiredCount;
+		}
+
+		case EObjectiveConditionType::Custom:
+		{
+			// Custom objectives richiedono implementazione specifica
+			UE_LOG(LogRosikoGameManager, Warning, TEXT("Custom objective condition - not implemented"));
+			return false;
+		}
+
+		default:
+			UE_LOG(LogRosikoGameManager, Warning, TEXT("Unknown objective condition type: %d"), (int32)Condition.Type);
+			return false;
+	}
+}
+
+bool ARosikoGameManager::DoesPlayerControlContinent(int32 PlayerID, int32 ContinentID)
+{
+	if (!MapGenerator)
+	{
+		return false;
+	}
+
+	ARosikoGameState* GS = GetRosikoGameState();
+	if (!GS)
+	{
+		return false;
+	}
+
+	// Ottieni tutti i territori del continente dal MapGenerator
+	const TArray<FGeneratedTerritory>& AllTerritories = MapGenerator->GetGeneratedTerritories();
+
+	int32 TotalInContinent = 0;
+	int32 OwnedInContinent = 0;
+
+	for (const FGeneratedTerritory& GenTerritory : AllTerritories)
+	{
+		if (GenTerritory.ContinentID == ContinentID && !GenTerritory.bIsOcean)
+		{
+			TotalInContinent++;
+
+			// Verifica se il giocatore lo possiede
+			FTerritoryGameState* TerritoryState = GS->GetTerritory(GenTerritory.ID);
+			if (TerritoryState && TerritoryState->OwnerID == PlayerID)
+			{
+				OwnedInContinent++;
+			}
+		}
+	}
+
+	// Il giocatore controlla il continente se possiede TUTTI i suoi territori
+	return (TotalInContinent > 0) && (OwnedInContinent == TotalInContinent);
+}
+
+int32 ARosikoGameManager::CountPlayerTerritoriesInContinent(int32 PlayerID, int32 ContinentID)
+{
+	if (!MapGenerator)
+	{
+		return 0;
+	}
+
+	ARosikoGameState* GS = GetRosikoGameState();
+	if (!GS)
+	{
+		return 0;
+	}
+
+	const TArray<FGeneratedTerritory>& AllTerritories = MapGenerator->GetGeneratedTerritories();
+	int32 Count = 0;
+
+	for (const FGeneratedTerritory& GenTerritory : AllTerritories)
+	{
+		if (GenTerritory.ContinentID == ContinentID && !GenTerritory.bIsOcean)
+		{
+			FTerritoryGameState* TerritoryState = GS->GetTerritory(GenTerritory.ID);
+			if (TerritoryState && TerritoryState->OwnerID == PlayerID)
+			{
+				Count++;
+			}
+		}
+	}
+
+	return Count;
+}

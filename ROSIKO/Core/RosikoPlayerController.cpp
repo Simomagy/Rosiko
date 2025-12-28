@@ -3,6 +3,10 @@
 #include "RosikoPlayerState.h"
 #include "RosikoGameMode.h"
 #include "EngineUtils.h"
+#include "EnhancedInputComponent.h"
+#include "EnhancedInputSubsystems.h"
+#include "Blueprint/UserWidget.h"
+#include "UI/ObjectivesPanelWidget.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogRosikoPlayerController, Log, All);
 
@@ -10,6 +14,52 @@ ARosikoPlayerController::ARosikoPlayerController()
 {
 	// Abilita replicazione
 	bReplicates = true;
+}
+
+void ARosikoPlayerController::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// Setup Enhanced Input Mapping Context (solo su client locale)
+	if (IsLocalController())
+	{
+		if (UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(GetLocalPlayer()))
+		{
+			if (GameMappingContext)
+			{
+				Subsystem->AddMappingContext(GameMappingContext, GameMappingPriority);
+				UE_LOG(LogRosikoPlayerController, Log, TEXT("Added Game Mapping Context (IMC_Game) with priority %d"), GameMappingPriority);
+			}
+			else
+			{
+				UE_LOG(LogRosikoPlayerController, Warning, TEXT("GameMappingContext is null! Assign IMC_Game in Blueprint Class Defaults."));
+			}
+		}
+	}
+}
+
+void ARosikoPlayerController::SetupInputComponent()
+{
+	Super::SetupInputComponent();
+
+	// Setup Enhanced Input bindings
+	if (UEnhancedInputComponent* EnhancedInputComponent = Cast<UEnhancedInputComponent>(InputComponent))
+	{
+		// Bind Toggle Objectives Action
+		if (ToggleObjectivesAction)
+		{
+			EnhancedInputComponent->BindAction(ToggleObjectivesAction, ETriggerEvent::Triggered, this, &ARosikoPlayerController::ToggleObjectivesPanel);
+			UE_LOG(LogRosikoPlayerController, Log, TEXT("Bound ToggleObjectivesAction (IA_ToggleObjectives)"));
+		}
+		else
+		{
+			UE_LOG(LogRosikoPlayerController, Warning, TEXT("ToggleObjectivesAction is null! Assign IA_ToggleObjectives in Blueprint Class Defaults."));
+		}
+	}
+	else
+	{
+		UE_LOG(LogRosikoPlayerController, Error, TEXT("Enhanced Input Component not found! Make sure Enhanced Input Plugin is enabled."));
+	}
 }
 
 void ARosikoPlayerController::FindGameManager()
@@ -128,5 +178,30 @@ void ARosikoPlayerController::Server_NotifyClientReady_Implementation()
 	else
 	{
 		UE_LOG(LogRosikoPlayerController, Error, TEXT("GameMode not found!"));
+	}
+}
+
+// === UI COMMANDS ===
+
+void ARosikoPlayerController::ToggleObjectivesPanel(const FInputActionValue& Value)
+{
+	// Questa funzione viene chiamata quando il player preme Tab (o il tasto configurato)
+	UE_LOG(LogRosikoPlayerController, Log, TEXT("ToggleObjectivesPanel called"));
+
+	// Cerca il widget HUD per chiamare il toggle
+	// NOTA: Questa è un'implementazione base. Potresti voler cachare il reference al HUD
+	UUserWidget* HUDWidget = nullptr;
+
+	// Cerca widget HUD tra i widget attivi
+	if (ULocalPlayer* LocalPlayer = GetLocalPlayer())
+	{
+		// TODO: Implementa logica per trovare GameHUD e chiamare toggle
+		// Per ora logghiamo che l'input è stato ricevuto
+		UE_LOG(LogRosikoPlayerController, Warning, TEXT("Toggle objectives input received - implement HUD widget toggle logic"));
+
+		// Esempio di come implementare:
+		// 1. Cache reference a GameHUDWidget in BeginPlay o quando viene creato
+		// 2. Chiama GameHUDWidget->ToggleObjectivesPanel()
+		// 3. O usa Event Dispatcher per notificare l'HUD
 	}
 }

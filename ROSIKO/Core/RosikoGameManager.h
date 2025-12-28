@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "../Configs/GameRulesConfig.h"
+#include "ROSIKO/Configs/ObjectivesConfig.h"
 #include "RosikoGameManager.generated.h"
 
 UENUM(BlueprintType)
@@ -92,6 +93,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Config")
 	UGameRulesConfig* GameRules;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Config")
+	UObjectivesConfig* ObjectivesConfig;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Config", meta = (ClampMin = "3", ClampMax = "10"))
 	int32 NumPlayers = 3; // Per ora hardcoded, poi verrà da lobby multiplayer
 
@@ -134,6 +138,10 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "Game State")
 	TArray<FTerritoryCard> CardDeck;
 
+	// Mazzi obiettivi filtrati per configurazione corrente (server-side only)
+	TArray<FObjectiveDefinition> ValidMainObjectives;
+	TArray<FObjectiveDefinition> ValidSecondaryObjectives;
+
 	// DEPRECATO: Ora in ARosikoGameState::TurnOrder
 	// UPROPERTY(Replicated, BlueprintReadOnly, Category = "Game State")
 	// TArray<int32> TurnOrder;
@@ -173,6 +181,23 @@ public:
 	// Ottieni tutti i PlayerStates attivi
 	UFUNCTION(BlueprintPure, Category = "Game State")
 	TArray<class ARosikoPlayerState*> GetAllPlayerStates() const;
+
+	// === OBIETTIVI ===
+
+	// Assegna obiettivi (1 principale + 4 secondari) a tutti i giocatori
+	// Chiamato dopo ColorSelection, prima di DistributeInitialTerritories
+	UFUNCTION(BlueprintCallable, Category = "Objectives")
+	void AssignObjectivesToAllPlayers();
+
+	// Verifica completamento obiettivi per un giocatore specifico
+	// Chiamato automaticamente a fine turno
+	UFUNCTION(BlueprintCallable, Category = "Objectives")
+	bool CheckPlayerObjectives(int32 PlayerID);
+
+	// Verifica completamento obiettivi per tutti i giocatori
+	// Usato per calcolo vittoria finale
+	UFUNCTION(BlueprintCallable, Category = "Objectives")
+	void CheckAllObjectivesCompletion();
 
 public:
 
@@ -233,6 +258,13 @@ private:
 	void StartColorSelection(); // Avvia fase selezione colori
 	void DistributeInitialTerritories();
 	void StartInitialPlacement();
+
+	// === OBIETTIVI - INTERNAL ===
+	void FilterAndShuffleObjectives(); // Filtra e mescola mazzi obiettivi
+	void AssignObjectivesToPlayer(ARosikoPlayerState* PS); // Assegna obiettivi a un singolo player
+	bool EvaluateObjectiveCondition(const FObjectiveCondition& Condition, ARosikoPlayerState* PS); // Valuta singola condizione
+	bool DoesPlayerControlContinent(int32 PlayerID, int32 ContinentID); // Helper per controllo continenti
+	int32 CountPlayerTerritoriesInContinent(int32 PlayerID, int32 ContinentID); // Conta territori in continente
 
 	// === HELPERS ===
 	void BroadcastTerritoryUpdate(int32 TerritoryID); // Aggiorna visuals + evento

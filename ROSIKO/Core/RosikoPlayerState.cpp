@@ -30,6 +30,11 @@ void ARosikoPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& O
 	DOREPLIFETIME(ARosikoPlayerState, CardExchangeCount);
 	DOREPLIFETIME(ARosikoPlayerState, bIsAlive);
 	DOREPLIFETIME(ARosikoPlayerState, bIsAI);
+	DOREPLIFETIME(ARosikoPlayerState, EliminatedBy);
+
+	// Replica obiettivi SOLO al proprietario (per segretezza)
+	DOREPLIFETIME_CONDITION(ARosikoPlayerState, MainObjective, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(ARosikoPlayerState, SecondaryObjectives, COND_OwnerOnly);
 }
 
 void ARosikoPlayerState::SetGameManagerPlayerID(int32 NewPlayerID)
@@ -109,8 +114,14 @@ void ARosikoPlayerState::RemoveTerritory(int32 TerritoryID)
 		if (OwnedTerritoryIDs.Num() == 0 && bIsAlive)
 		{
 			bIsAlive = false;
-			UE_LOG(LogRosikoPlayerState, Warning, TEXT("Player %d - ELIMINATED (no territories left)"),
-			       GameManagerPlayerID);
+			// Nota: EliminatedBy deve essere settato dal GameManager durante la conquista
+			// qui mettiamo -1 come fallback (eliminato dal sistema)
+			if (EliminatedBy < 0)
+			{
+				EliminatedBy = -1;
+			}
+			UE_LOG(LogRosikoPlayerState, Warning, TEXT("Player %d - ELIMINATED (no territories left, eliminated by Player %d)"),
+			       GameManagerPlayerID, EliminatedBy);
 		}
 	}
 }
@@ -133,4 +144,185 @@ void ARosikoPlayerState::RemoveCard(const FTerritoryCard& Card)
 		UE_LOG(LogRosikoPlayerState, Log, TEXT("Player %d - Removed card for territory %d (Hand size: %d)"),
 		       GameManagerPlayerID, Card.TerritoryID, Hand.Num());
 	}
+}
+
+// === OBIETTIVI - QUERY METHODS ===
+
+int32 ARosikoPlayerState::GetTotalVictoryPoints() const
+{
+	int32 TotalPoints = 0;
+
+	// Conta punti da obiettivi secondari completati
+	for (const FAssignedObjective& Objective : SecondaryObjectives)
+	{
+		if (Objective.bCompleted)
+		{
+			TotalPoints += Objective.Definition.VictoryPoints;
+		}
+	}
+
+	return TotalPoints;
+}
+
+int32 ARosikoPlayerState::GetCompletedSecondaryCount() const
+{
+	int32 Count = 0;
+	for (const FAssignedObjective& Objective : SecondaryObjectives)
+	{
+		if (Objective.bCompleted)
+		{
+			Count++;
+		}
+	}
+	return Count;
+}
+
+// === REP NOTIFIES ===
+
+void ARosikoPlayerState::OnRep_MainObjective()
+{
+	// Chiamato sul client quando MainObjective viene replicato dal server
+	UE_LOG(LogRosikoPlayerState, Warning, TEXT("🔔 OnRep_MainObjective: Objective %d assigned!"), MainObjective.ObjectiveIndex);
+
+	// Broadcast evento per notificare UI
+	OnObjectivesUpdated.Broadcast();
+}
+
+void ARosikoPlayerState::OnRep_SecondaryObjectives()
+{
+	// Chiamato sul client quando SecondaryObjectives vengono replicati dal server
+	UE_LOG(LogRosikoPlayerState, Warning, TEXT("🔔 OnRep_SecondaryObjectives: %d objectives assigned!"), SecondaryObjectives.Num());
+
+	// Broadcast evento per notificare UI
+	OnObjectivesUpdated.Broadcast();
+}
+
+bool ARosikoPlayerState::HasCompletedAllSecondaryObjectives() const
+{
+	if (SecondaryObjectives.Num() == 0)
+	{
+		return false; // Nessun obiettivo assegnato
+	}
+
+	for (const FAssignedObjective& Objective : SecondaryObjectives)
+	{
+		if (!Objective.bCompleted)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+TArray<FAssignedObjective> ARosikoPlayerState::GetAllObjectives() const
+{
+	TArray<FAssignedObjective> AllObjectives;
+
+	// Aggiungi obiettivo principale (se assegnato)
+	if (MainObjective.ObjectiveIndex >= 0)
+	{
+		AllObjectives.Add(MainObjective);
+	}
+
+	// Aggiungi obiettivi secondari
+	AllObjectives.Append(SecondaryObjectives);
+
+	return AllObjectives;
+}
+
+// === OBIETTIVI - ASSIGNMENT METHODS ===
+
+void ARosikoPlayerState::AssignMainObjective(const FObjectiveDefinition& Objective, int32 ObjectiveIndex)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogRosikoPlayerState, Error, TEXT("AssignMainObjective called on client - must be called on server!"));
+		return;
+	}
+
+	MainObjective.Definition = Objective;
+	MainObjective.ObjectiveIndex = ObjectiveIndex;
+	MainObjective.bCompleted = false;
+	MainObjective.CompletionTurn = -1;
+	MainObjective.CompletionTimeSeconds = -1.0f;
+
+	UE_LOG(LogRosikoPlayerState, Log, TEXT("Player %d - Assigned main objective: '%s' (Index: %d)"),
+	       GameManagerPlayerID, *Objective.DisplayName.ToString(), ObjectiveIndex);
+}
+
+void ARosikoPlayerState::AssignSecondaryObjective(const FObjectiveDefinition& Objective, int32 ObjectiveIndex)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogRosikoPlayerState, Error, TEXT("AssignSecondaryObjective called on client - must be called on server!"));
+		return;
+	}
+
+	FAssignedObjective NewObjective;
+	NewObjective.Definition = Objective;
+	NewObjective.ObjectiveIndex = ObjectiveIndex;
+	NewObjective.bCompleted = false;
+	NewObjective.CompletionTurn = -1;
+	NewObjective.CompletionTimeSeconds = -1.0f;
+
+	SecondaryObjectives.Add(NewObjective);
+
+	UE_LOG(LogRosikoPlayerState, Log, TEXT("Player %d - Assigned secondary objective %d: '%s' (Index: %d, %d points)"),
+	       GameManagerPlayerID, SecondaryObjectives.Num(), *Objective.DisplayName.ToString(),
+	       ObjectiveIndex, Objective.VictoryPoints);
+}
+
+void ARosikoPlayerState::CompleteMainObjective(int32 CompletionTurn, float CompletionTime)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogRosikoPlayerState, Error, TEXT("CompleteMainObjective called on client - must be called on server!"));
+		return;
+	}
+
+	if (MainObjective.bCompleted)
+	{
+		UE_LOG(LogRosikoPlayerState, Warning, TEXT("Player %d - Main objective already completed!"), GameManagerPlayerID);
+		return;
+	}
+
+	MainObjective.bCompleted = true;
+	MainObjective.CompletionTurn = CompletionTurn;
+	MainObjective.CompletionTimeSeconds = CompletionTime;
+
+	UE_LOG(LogRosikoPlayerState, Warning, TEXT("Player %d - COMPLETED MAIN OBJECTIVE: '%s' (Turn: %d)"),
+	       GameManagerPlayerID, *MainObjective.Definition.DisplayName.ToString(), CompletionTurn);
+}
+
+void ARosikoPlayerState::CompleteSecondaryObjective(int32 SecondaryIndex, int32 CompletionTurn, float CompletionTime)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogRosikoPlayerState, Error, TEXT("CompleteSecondaryObjective called on client - must be called on server!"));
+		return;
+	}
+
+	if (!SecondaryObjectives.IsValidIndex(SecondaryIndex))
+	{
+		UE_LOG(LogRosikoPlayerState, Error, TEXT("Player %d - Invalid secondary objective index: %d"),
+		       GameManagerPlayerID, SecondaryIndex);
+		return;
+	}
+
+	FAssignedObjective& Objective = SecondaryObjectives[SecondaryIndex];
+
+	if (Objective.bCompleted)
+	{
+		UE_LOG(LogRosikoPlayerState, Warning, TEXT("Player %d - Secondary objective %d already completed!"),
+		       GameManagerPlayerID, SecondaryIndex);
+		return;
+	}
+
+	Objective.bCompleted = true;
+	Objective.CompletionTurn = CompletionTurn;
+	Objective.CompletionTimeSeconds = CompletionTime;
+
+	UE_LOG(LogRosikoPlayerState, Warning, TEXT("Player %d - COMPLETED SECONDARY OBJECTIVE: '%s' (+%d points, Turn: %d)"),
+	       GameManagerPlayerID, *Objective.Definition.DisplayName.ToString(),
+	       Objective.Definition.VictoryPoints, CompletionTurn);
 }
